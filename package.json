@@ -1,0 +1,14 @@
+{
+  "name": "memory-forge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "An in-memory GitHub-compatible forge with REST, GraphQL, MCP and git smart HTTP",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types main.ts"
+  }
+}
