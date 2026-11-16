@@ -69,6 +69,17 @@ export function ancestors(tip: string): Set<string> {
   }
   return found;
 }
+export function isAncestor(ancestor: string, tip: string): boolean {
+  const seen = new Set<string>(), todo = [tip];
+  while (todo.length) {
+    const oid = todo.pop()!;
+    if (oid === ancestor) return true;
+    if (!oid || seen.has(oid)) continue;
+    seen.add(oid);
+    if (objects.get(oid)?.type === 'commit') todo.push(...commit(oid).parents);
+  }
+  return false;
+}
 export function mergeBase(a: string, b: string): string {
   const left = ancestors(a), todo = [b], seen = new Set<string>();
   while (todo.length) {

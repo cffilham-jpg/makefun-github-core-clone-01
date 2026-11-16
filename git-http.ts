@@ -1,4 +1,4 @@
-import { objects, zero, ancestors, reachable } from './objects.ts';
+import { objects, zero, isAncestor, reachable } from './objects.ts';
 import { pack, unpack } from './pack.ts';
 import { getRepo, tip, ApiError, type Repo } from './store.ts';
 
@@ -68,7 +68,7 @@ export function gitHttp(method: string, path: string, q: URLSearchParams, raw: B
       const current = r.refs.get(ref) ?? zero;
       if (!reason && current !== old) reason = 'stale ref';
       if (!reason && next !== zero && !objects.has(next)) reason = 'missing object';
-      if (!reason && old !== zero && next !== zero && !ancestors(next).has(old)) reason = 'non-fast-forward';
+      if (!reason && old !== zero && next !== zero && !isAncestor(old, next)) reason = 'non-fast-forward';
       if (reason) report.push(pkt(`ng ${ref} ${reason}\n`));
       else { if (next === zero) r.refs.delete(ref); else r.refs.set(ref, next); report.push(pkt(`ok ${ref}\n`)); }
     }
