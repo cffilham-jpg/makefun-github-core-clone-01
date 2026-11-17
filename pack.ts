@@ -1,4 +1,5 @@
 import { inflateSync, deflateSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
 import { digest, objects, put, type GitObject } from './objects.ts';
 
 const types = ['', 'commit', 'tree', 'blob', 'tag'];
@@ -77,7 +78,8 @@ export function unpack(data: Buffer) {
       obj = { type: base.type, data: delta(base.data, e.data) };
     }
     // Compute ids without mutating the live object store until every entry resolves.
-    const oid = digest(Buffer.concat([Buffer.from(`${obj.type} ${obj.data.length}\0`), obj.data])).toString('hex');
+    // Stream the header + data into the hash: no Buffer.concat copy of the object.
+    const oid = createHash('sha1').update(`${obj.type} ${obj.data.length}\0`).update(obj.data).digest('hex');
     e.object = obj; staged.set(oid, obj); return obj;
   };
   let pending = entries;

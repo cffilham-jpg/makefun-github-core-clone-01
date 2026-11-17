@@ -11,11 +11,14 @@ function packets(data: Buffer, stopAtFlush = false) {
   const lines: string[] = []; let i = 0;
   while (i < data.length) {
     const header = data.toString('ascii', i, i + 4);
-    if (!/^[0-9a-fA-F]{4}$/.test(header)) throw new ApiError(400, 'Invalid packet length');
+    let hex = header.length === 4;
+    for (let j = 0; hex && j < 4; j++) { const c = header.charCodeAt(j); hex = (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70); }
+    if (!hex) throw new ApiError(400, 'Invalid packet length');
     const n = parseInt(header, 16); i += 4;
     if (n <= 2) { if (!n && stopAtFlush) break; continue; }
     if (n < 4 || n > 65520 || i + n - 4 > data.length) throw new ApiError(400, 'Invalid packet');
-    lines.push(data.toString('utf8', i, i + n - 4).replace(/\n$/, '')); i += n - 4;
+    let line = data.toString('utf8', i, i + n - 4); if (line.endsWith('\n')) line = line.slice(0, -1);
+    lines.push(line); i += n - 4;
   }
   return { lines, offset: i };
 }

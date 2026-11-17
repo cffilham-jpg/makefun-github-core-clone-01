@@ -1,97 +1,180 @@
-import { createServer } from 'node:http';
+import { createServer } from 'node:net';
 import { rest } from './rest.ts';
 import { ApiError } from './store.ts';
 import { gitHttp } from './git-http.ts';
 import { graphql } from './graphql.ts';
 import { mcp } from './mcp.ts';
 
+// Raw TCP transport: one hand-rolled HTTP/1.1 parser over node:net, replacing
+// node:http. Same dispatch semantics as the node:http build (same caches, same
+// invalidation, same replies); only the transport changes. The kit clients
+// (undici fetch) send content-length bodies on keep-alive connections and never
+// chunked bodies, HEAD, or pipelining — but chunked decoding, HEAD, and
+// pipelined requests are all handled anyway.
+
+const REASONS: Record<number, string> = { 200: 'OK', 201: 'Created', 202: 'Accepted', 204: 'No Content', 400: 'Bad Request', 401: 'Unauthorized', 404: 'Not Found', 405: 'Method Not Allowed', 409: 'Conflict', 422: 'Unprocessable Entity' };
+
+function decodeChunked(data: Buffer): { body: Buffer; consumed: number } | null {
+  const parts: Buffer[] = [];
+  let i = 0;
+  for (;;) {
+    const lineEnd = data.indexOf('\r\n', i);
+    if (lineEnd < 0) return null;
+    const sizeText = data.toString('ascii', i, lineEnd).split(';')[0].trim();
+    if (!/^[0-9a-fA-F]+$/.test(sizeText)) throw new Error('bad chunk size');
+    const size = parseInt(sizeText, 16);
+    i = lineEnd + 2;
+    if (size === 0) {
+      for (;;) {
+        const tEnd = data.indexOf('\r\n', i);
+        if (tEnd < 0) return null;
+        if (tEnd === i) return { body: Buffer.concat(parts), consumed: i + 2 };
+        i = tEnd + 2;
+      }
+    }
+    if (data.length < i + size + 2) return null;
+    parts.push(data.subarray(i, i + size));
+    i += size;
+    if (data[i] !== 13 || data[i + 1] !== 10) throw new Error('bad chunk end');
+    i += 2;
+  }
+}
+
 export function createApp() {
   let requests = 0;
-  // Cache complete wire replies, including pack framing and checksums. Only
-  // read-only git exchanges enter this cache; all possible writes clear it.
-  const gitReplies = new Map<string, { type: string; data: Buffer }>();
-  const restReplies = new Map<string, { data: string; headers: Record<string, string | number> }>();
+  // Hoisted once: process.env access and the expected header are per-request costs.
+  const shopToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  const expectedAuth = shopToken ? `Bearer ${shopToken}` : '';
+  // Cached tails: everything after the status line + request-id line — the
+  // remaining headers, the blank line, and the body — pre-built once, so a
+  // cache hit is one Buffer.concat and one socket.write.
+  const gitReplies = new Map<string, Buffer>();
+  const restReplies = new Map<string, Buffer>();
   let gitBytes = 0;
   let restBytes = 0;
-  return createServer((req, res) => {
-    res.setHeader('x-github-request-id', `req-${++requests}`);
-    const json = (status: number, body: any, headers = {}) => {
-      const data = status === 204 ? '' : JSON.stringify(body);
-      res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(data), ...headers }); res.end(data);
-    };
+
+  const jsonTail = (status: number, body: any, extra: Array<[string, string]> = []): { status: number; tail: Buffer } => {
+    const data = Buffer.from(status === 204 ? '' : JSON.stringify(body));
+    let head = `content-type: application/json\r\ncontent-length: ${data.length}\r\n`;
+    for (const [k, v] of extra) head += `${k}: ${v}\r\n`;
+    return { status, tail: Buffer.concat([Buffer.from(head + '\r\n'), data]) };
+  };
+
+  // One request -> { status, tail }. Same semantics as the node:http dispatch.
+  const handle = (method: string, target: string, h: Record<string, string | undefined>, raw: Buffer): { status: number; tail: Buffer } => {
     try {
-      const method = req.method ?? 'GET';
-      const hasBody = !!req.headers['transfer-encoding'] || Number(req.headers['content-length'] ?? 0) > 0;
-      // Authentication and request ids remain per-request, even on cache hits.
-      const restKey = method === 'GET' && !hasBody ? JSON.stringify([req.headers.host, req.url]) : '';
-      const authorized = !!process.env.MAKEFUN_SHOP_TOKEN && req.headers.authorization === `Bearer ${process.env.MAKEFUN_SHOP_TOKEN}`;
-      const cachedRest = authorized && restKey && restReplies.get(restKey);
-      if (cachedRest) {
-        req.resume();
-        res.writeHead(200, cachedRest.headers);
-        return res.end(cachedRest.data);
+      const hasBody = !!h['transfer-encoding'] || Number(h['content-length'] ?? 0) > 0;
+      const restKey = method === 'GET' && !hasBody ? (h.host ?? '') + ' ' + target : '';
+      const authorized = !!expectedAuth && h.authorization === expectedAuth;
+      if (authorized && restKey) {
+        const cached = restReplies.get(restKey);
+        if (cached) return { status: 200, tail: cached };
       }
-      const url = new URL(req.url ?? '/', 'http://' + (req.headers.host ?? 'localhost'));
+      const url = new URL(target, 'http://' + (h.host ?? 'localhost'));
       const path = decodeURIComponent(url.pathname);
-      if (method === 'GET' && path === '/healthz') return json(200, { ok: true });
-      if (!process.env.MAKEFUN_SHOP_TOKEN || req.headers.authorization !== `Bearer ${process.env.MAKEFUN_SHOP_TOKEN}`) return json(401, { message: 'Bad credentials' });
-      const dispatch = (raw: Buffer) => {
+      if (method === 'GET' && path === '/healthz') return jsonTail(200, { ok: true });
+      if (!expectedAuth || h.authorization !== expectedAuth) return jsonTail(401, { message: 'Bad credentials' });
       try {
-      const gitRead = /\.git\/git-upload-pack$/.test(path) && method === 'POST';
-      if (method !== 'GET' && method !== 'HEAD' && !gitRead) {
-        gitReplies.clear(); gitBytes = 0;
-        restReplies.clear(); restBytes = 0;
-      }
-      if (/\.git\//.test(path)) {
-        const cacheKey = (method === 'GET' || gitRead) && raw.length <= 65536
-          ? JSON.stringify([method, req.url, req.headers['git-protocol'], raw.toString('base64')]) : '';
-        const cached = cacheKey && gitReplies.get(cacheKey);
-        if (cached) {
-          res.writeHead(200, { 'content-type': cached.type, 'content-length': cached.data.length });
-          return res.end(cached.data);
+        const gitRead = /\.git\/git-upload-pack$/.test(path) && method === 'POST';
+        if (method !== 'GET' && method !== 'HEAD' && !gitRead) {
+          gitReplies.clear(); gitBytes = 0;
+          restReplies.clear(); restBytes = 0;
         }
-        const reply = gitHttp(method, path, url.searchParams, raw, req.headers['git-protocol'] === 'version=2');
-        if (cacheKey && reply.data.length <= 4 * 1024 * 1024) {
-          if (gitReplies.size >= 128 || gitBytes + reply.data.length > 8 * 1024 * 1024) { gitReplies.clear(); gitBytes = 0; }
-          gitReplies.set(cacheKey, reply); gitBytes += reply.data.length;
+        if (/\.git\//.test(path)) {
+          const cacheKey = (method === 'GET' || gitRead) && raw.length <= 65536
+            ? JSON.stringify([method, target, h['git-protocol'], raw.toString('base64')]) : '';
+          const cached = cacheKey && gitReplies.get(cacheKey);
+          if (cached) return { status: 200, tail: cached };
+          const reply = gitHttp(method, path, url.searchParams, raw, h['git-protocol'] === 'version=2');
+          const tail = Buffer.concat([Buffer.from(`content-type: ${reply.type}\r\ncontent-length: ${reply.data.length}\r\n\r\n`), reply.data]);
+          if (cacheKey && reply.data.length <= 4 * 1024 * 1024) {
+            if (gitReplies.size >= 128 || gitBytes + reply.data.length > 8 * 1024 * 1024) { gitReplies.clear(); gitBytes = 0; }
+            gitReplies.set(cacheKey, tail); gitBytes += reply.data.length;
+          }
+          return { status: 200, tail };
         }
-        res.writeHead(200, { 'content-type': reply.type, 'content-length': reply.data.length });
-        return res.end(reply.data);
-      }
-      let body: any = {};
-      if (raw.length) {
-        try { body = JSON.parse(raw.toString()); }
-        catch { return json(400, path === '/mcp' ? { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } } : { message: 'Malformed JSON' }); }
-      }
-      if (path === '/api/graphql' && method === 'POST') return json(200, graphql(body));
-      if (path === '/mcp' && method === 'POST') {
-        if (req.headers['mcp-session-id']) res.setHeader('mcp-session-id', req.headers['mcp-session-id']);
-        if (body.id === undefined) { res.writeHead(202); return res.end(); }
-        return json(200, mcp(body));
-      }
-      const reply = rest(method, path, url.searchParams, body, url.origin);
-      if (restKey && reply.status === 200) {
-        const data = JSON.stringify(reply.body), length = Buffer.byteLength(data);
-        const headers = { 'content-type': 'application/json', 'content-length': length, ...reply.headers };
-        if (length <= 1024 * 1024) {
-          if (restReplies.size >= 256 || restBytes + length > 4 * 1024 * 1024) { restReplies.clear(); restBytes = 0; }
-          restReplies.set(restKey, { data, headers }); restBytes += length;
+        let body: any = {};
+        if (raw.length) {
+          try { body = JSON.parse(raw.toString()); }
+          catch { return jsonTail(400, path === '/mcp' ? { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } } : { message: 'Malformed JSON' }); }
         }
-        res.writeHead(200, headers); return res.end(data);
-      }
-      json(reply.status, reply.body, reply.headers);
+        if (path === '/api/graphql' && method === 'POST') return jsonTail(200, graphql(body));
+        if (path === '/mcp' && method === 'POST') {
+          const extra: Array<[string, string]> = h['mcp-session-id'] ? [['mcp-session-id', h['mcp-session-id']]] : [];
+          if (body.id === undefined) return { status: 202, tail: Buffer.from('content-length: 0\r\n\r\n') };
+          return jsonTail(200, mcp(body), extra);
+        }
+        const reply = rest(method, path, url.searchParams, body, url.origin);
+        if (restKey && reply.status === 200) {
+          const data = Buffer.from(JSON.stringify(reply.body));
+          let head = `content-type: application/json\r\ncontent-length: ${data.length}\r\n`;
+          for (const [k, v] of Object.entries(reply.headers ?? {})) head += `${k}: ${v}\r\n`;
+          const tail = Buffer.concat([Buffer.from(head + '\r\n'), data]);
+          if (data.length <= 1024 * 1024) {
+            if (restReplies.size >= 256 || restBytes + data.length > 4 * 1024 * 1024) { restReplies.clear(); restBytes = 0; }
+            restReplies.set(restKey, tail); restBytes += data.length;
+          }
+          return { status: 200, tail };
+        }
+        return jsonTail(reply.status, reply.body, Object.entries(reply.headers ?? {}) as Array<[string, string]>);
       } catch (error) {
-        json(error instanceof ApiError ? error.status : 400, { message: error instanceof Error ? error.message : 'Bad Request' });
+        return jsonTail(error instanceof ApiError ? error.status : 400, { message: error instanceof Error ? error.message : 'Bad Request' });
       }
-      };
-      if (!hasBody) { req.resume(); return dispatch(Buffer.alloc(0)); }
-      const chunks: Buffer[] = [];
-      req.on('data', (chunk: Buffer) => chunks.push(chunk));
-      req.on('end', () => dispatch(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)));
-      req.on('error', () => res.destroy());
-      req.on('aborted', () => res.destroy());
     } catch (error) {
-      json(error instanceof ApiError ? error.status : 400, { message: error instanceof Error ? error.message : 'Bad Request' });
+      return jsonTail(error instanceof ApiError ? error.status : 400, { message: error instanceof Error ? error.message : 'Bad Request' });
     }
+  };
+
+  return createServer((socket) => {
+    let buf = Buffer.alloc(0);
+    const badRequest = () => { try { socket.write(Buffer.from('HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n')); } catch {} socket.destroy(); };
+    socket.on('data', (chunk: Buffer) => {
+      buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
+      for (;;) {
+        const headEnd = buf.indexOf('\r\n\r\n');
+        if (headEnd < 0) {
+          if (buf.length > 65536) return badRequest();
+          return;
+        }
+        const lines = buf.toString('ascii', 0, headEnd).split('\r\n');
+        const firstSpace = lines[0].indexOf(' '), lastSpace = lines[0].lastIndexOf(' ');
+        const method = lines[0].slice(0, firstSpace), target = lines[0].slice(firstSpace + 1, lastSpace), version = lines[0].slice(lastSpace + 1);
+        if (firstSpace <= 0 || lastSpace <= firstSpace + 1 || !/^HTTP\/\d\.\d$/.test(version)) return badRequest();
+        const h: Record<string, string | undefined> = {};
+        for (let i = 1; i < lines.length; i++) {
+          const colon = lines[i].indexOf(':');
+          if (colon <= 0) continue;
+          const name = lines[i].slice(0, colon).trim().toLowerCase();
+          if (h[name] === undefined) h[name] = lines[i].slice(colon + 1).trim();
+        }
+        if ((h.expect ?? '').toLowerCase() === '100-continue') socket.write(Buffer.from('HTTP/1.1 100 Continue\r\n\r\n'));
+        const chunked = (h['transfer-encoding'] ?? '').toLowerCase().includes('chunked');
+        const contentLength = Number(h['content-length'] ?? 0);
+        let bodyStart = headEnd + 4;
+        let raw: Buffer;
+        try {
+          if (chunked) {
+            const decoded = decodeChunked(buf.subarray(bodyStart));
+            if (!decoded) return;
+            raw = decoded.body; bodyStart += decoded.consumed;
+          } else if (contentLength > 0) {
+            if (!Number.isFinite(contentLength)) return badRequest();
+            if (buf.length < bodyStart + contentLength) return;
+            raw = buf.subarray(bodyStart, bodyStart + contentLength);
+            bodyStart += contentLength;
+          } else raw = Buffer.alloc(0);
+        } catch { return badRequest(); }
+        buf = buf.subarray(bodyStart);
+        const conn = (h.connection ?? '').toLowerCase();
+        const closeAfter = conn.includes('close') || (version === 'HTTP/1.0' && !conn.includes('keep-alive'));
+        const { status, tail } = handle(method, target, h, raw);
+        const head = Buffer.from(`HTTP/1.1 ${status} ${REASONS[status] ?? ''}\r\nx-github-request-id: req-${++requests}\r\n`);
+        // HEAD answers carry the headers but no body (no kit client sends HEAD).
+        const out = method === 'HEAD' ? Buffer.concat([head, tail.subarray(0, tail.indexOf('\r\n\r\n') + 4)]) : Buffer.concat([head, tail]);
+        socket.write(out);
+        if (closeAfter) { socket.end(); return; }
+      }
+    });
+    socket.on('error', () => socket.destroy());
   });
 }
