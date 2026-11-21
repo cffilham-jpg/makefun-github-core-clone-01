@@ -76,9 +76,28 @@ export function isAncestor(ancestor: string, tip: string): boolean {
     if (oid === ancestor) return true;
     if (!oid || seen.has(oid)) continue;
     seen.add(oid);
-    if (objects.get(oid)?.type === 'commit') todo.push(...commit(oid).parents);
+    if (objects.get(oid)?.type === 'commit') todo.push(...parentsOf(oid));
   }
   return false;
+}
+// Parents only, scanned from the raw commit bytes: avoids commit()'s full
+// toString + split + line-object build. Only header lines starting with
+// 'parent ' (before the blank line) are read.
+function parentsOf(oid: string): string[] {
+  const data = objects.get(oid)?.data;
+  if (!data) return [];
+  const blank = data.indexOf('\n\n');
+  const limit = blank < 0 ? data.length : blank;
+  const parents: string[] = [];
+  let i = 0;
+  for (;;) {
+    const idx = data.indexOf('parent ', i);
+    if (idx < 0 || idx + 47 > limit) break;
+    if (idx !== 0 && data[idx - 1] !== 10) { i = idx + 7; continue; }
+    parents.push(data.toString('ascii', idx + 7, idx + 47));
+    i = idx + 47;
+  }
+  return parents;
 }
 export function mergeBase(a: string, b: string): string {
   const left = ancestors(a), todo = [b], seen = new Set<string>();

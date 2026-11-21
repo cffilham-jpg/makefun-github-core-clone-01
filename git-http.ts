@@ -7,6 +7,21 @@ export function pkt(value: string | Buffer) {
   const data = Buffer.isBuffer(value) ? value : Buffer.from(value);
   return Buffer.concat([Buffer.from((data.length + 4).toString(16).padStart(4, '0')), data]);
 }
+// Push a pkt-line as two buffers (4-byte hex header + payload) instead of one
+// concatenated buffer: the final Buffer.concat copies each byte once.
+function pushPkt(parts: Buffer[], value: string | Buffer) {
+  const data = Buffer.isBuffer(value) ? value : Buffer.from(value);
+  parts.push(Buffer.from((data.length + 4).toString(16).padStart(4, '0')), data);
+}
+// Lowercase 40-hex check without a regex engine.
+function isHex40(s: string): boolean {
+  if (s.length !== 40) return false;
+  for (let i = 0; i < 40; i++) {
+    const c = s.charCodeAt(i);
+    if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102))) return false;
+  }
+  return true;
+}
 function packets(data: Buffer, stopAtFlush = false) {
   const lines: string[] = []; let i = 0;
   while (i < data.length) {
@@ -47,15 +62,15 @@ export function gitHttp(method: string, path: string, q: URLSearchParams, raw: B
   const upload = service === 'git-upload-pack', advertisement = suffix === 'info/refs';
   const parts: Buffer[] = [];
   if (advertisement && method === 'GET') {
-    if (upload && v2) parts.push(...['version 2\n', 'agent=memory-forge/1\n', 'ls-refs=unborn\n', 'fetch=shallow\n', 'object-format=sha1\n'].map(pkt), flush);
+    if (upload && v2) { for (const line of ['version 2\n', 'agent=memory-forge/1\n', 'ls-refs=unborn\n', 'fetch=shallow\n', 'object-format=sha1\n']) pushPkt(parts, line); parts.push(flush); }
     else {
-      parts.push(pkt(`# service=${service}\n`), flush);
+      pushPkt(parts, `# service=${service}\n`); parts.push(flush);
       const capabilities = upload ? `side-band-64k shallow ofs-delta symref=HEAD:refs/heads/${r.default_branch} agent=memory-forge/1` : 'report-status side-band-64k delete-refs ofs-delta agent=memory-forge/1';
       const list = refs(r);
       if (!list.length) list.push(['capabilities^{}', zero]);
       list.forEach(([ref, oid], i) => {
-        parts.push(pkt(`${oid} ${ref}${i === 0 ? '\0' + capabilities : ''}\n`));
-        if (ref.startsWith('refs/tags/') && peeled(oid) !== oid) parts.push(pkt(`${peeled(oid)} ${ref}^{}\n`));
+        pushPkt(parts, `${oid} ${ref}${i === 0 ? '\0' + capabilities : ''}\n`);
+        if (ref.startsWith('refs/tags/') && peeled(oid) !== oid) pushPkt(parts, `${peeled(oid)} ${ref}^{}\n`);
       });
       parts.push(flush);
     }
@@ -66,7 +81,7 @@ export function gitHttp(method: string, path: string, q: URLSearchParams, raw: B
     const report = [pkt(`unpack ${unpackError || 'ok'}\n`)];
     for (const line of lines) {
       const [old, next, ref] = line.split('\0')[0].trim().split(' ');
-      if (!/^[0-9a-f]{40}$/.test(old) || !/^[0-9a-f]{40}$/.test(next) || !ref?.startsWith('refs/')) throw new ApiError(400, 'Invalid ref command');
+      if (!isHex40(old) || !isHex40(next) || !ref?.startsWith('refs/')) throw new ApiError(400, 'Invalid ref command');
       let reason = unpackError ? 'unpacker error' : '';
       const current = r.refs.get(ref) ?? zero;
       if (!reason && current !== old) reason = 'stale ref';
